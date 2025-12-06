@@ -8,3 +8,5 @@ supervision
 ultralytics
 streamlit
 parse
+fpdf2 
+pandas
