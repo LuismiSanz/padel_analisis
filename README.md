@@ -27,6 +27,7 @@ Puedes ejecutar la aplicación de dos formas: usando **Docker** (recomendado) o 
 1.  Descarga los archivos desde este enlace: [Google Drive - Model Weights](https://drive.google.com/drive/folders/1joO7w1Am7B418SIqGBq90YipQl81FMzh)
 2.  Descomprime o coloca los archivos dentro de la carpeta `weights/` en la raíz del proyecto.
     *   La estructura debe quedar así: `padel_analisis/weights/players_detection/yolov8m.pt`, etc.
+3. Crea una carpeta llamada cache en el directorio raiz de la aplicación.
 
 ### Opción A: Docker (Recomendado)
 
