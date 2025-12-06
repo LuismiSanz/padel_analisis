@@ -15,46 +15,56 @@ class ShotDetector:
 
     def detect_shots(self, df: pd.DataFrame, fps: float) -> pd.DataFrame:
         """
-        Detects shots based on ball acceleration peaks and player proximity.
+        Detecta golpes basándose en picos de aceleración y clasifica el tipo
+        usando posición en pista y velocidad de salida.
         """
         shots = []
         
-        # Ensure we have ball data
+        # Verificar datos mínimos
         if "ball_Vnorm1" not in df.columns:
             return pd.DataFrame()
 
-        # 1. Detect impacts based on high acceleration/velocity change
-        # We look for peaks in ball acceleration or sudden changes in velocity direction
-        # For simplicity, let's look for local maxima in acceleration that exceed a threshold
-        # AND are close to a player.
+        # --- CONSTANTES Y UMBRALES ---
+        ACCEL_THRESHOLD = 40.0      # m/s^2 (Bajado un poco para detectar toques suaves)
+        PROXIMITY_THRESHOLD = 2.5   # metros (Margen ampliado para errores de detección)
         
-        # Thresholds (heuristic)
-        ACCEL_THRESHOLD = 50.0 # m/s^2 - arbitrary, needs tuning
-        PROXIMITY_THRESHOLD = 2.0 # meters
+        # Umbrales de Zona (Asumiendo 0=Red, 10=Cristal de fondo)
+        NET_ZONE_LIMIT = 5.0        # Metros desde la red. Menos de 5m es "Zona de Red"
         
-        # Smoothing to reduce noise
-        df["ball_Anorm1_smooth"] = df["ball_Anorm1"].rolling(window=3, center=True).mean()
+        # Umbrales de Velocidad (km/h) para clasificación
+        SPEED_SMASH = 85.0          # Más de 85 km/h es seguramente un remate
+        SPEED_LOB = 35.0            # Menos de 35 km/h desde el fondo suele ser globo
         
-        # Find peaks
-        # A peak is where accel[t] > accel[t-1] and accel[t] > accel[t+1]
+        # 1. Suavizado de datos para reducir ruido
+        # Usamos aceleración si existe, o calculamos derivada de velocidad
+        if "ball_Anorm1" in df.columns:
+            accel_series = df["ball_Anorm1"]
+        else:
+            # Fallback simple si no hay columna de aceleración
+            accel_series = df["ball_Vnorm1"].diff().abs().fillna(0)
+
+        df["ball_accel_smooth"] = accel_series.rolling(window=3, center=True).mean().fillna(0)
+        
+        # 2. Detección de Picos (Impactos)
         potential_impacts = []
         for i in range(2, len(df) - 2):
-            accel_prev = df.iloc[i-1]["ball_Anorm1_smooth"]
-            accel_curr = df.iloc[i]["ball_Anorm1_smooth"]
-            accel_next = df.iloc[i+1]["ball_Anorm1_smooth"]
+            curr = df.iloc[i]["ball_accel_smooth"]
+            prev = df.iloc[i-1]["ball_accel_smooth"]
+            nxt  = df.iloc[i+1]["ball_accel_smooth"]
             
-            if accel_curr > ACCEL_THRESHOLD and accel_curr > accel_prev and accel_curr > accel_next:
+            # Es un pico local y supera el umbral
+            if curr > ACCEL_THRESHOLD and curr > prev and curr > nxt:
                 potential_impacts.append(i)
         
-        # Filter impacts by player proximity
+        # 3. Filtrado y Clasificación
         last_shot_frame = -100
         
         for idx in potential_impacts:
             row = df.iloc[idx]
             frame = int(row["frame"])
             
-            # Debounce: avoid multiple detections for the same shot
-            if frame - last_shot_frame < fps * 0.5: # 0.5 seconds debounce
+            # Debounce (evitar dobles detecciones del mismo golpe)
+            if frame - last_shot_frame < fps * 0.6: 
                 continue
                 
             ball_x = row["ball_x"]
@@ -63,12 +73,19 @@ class ShotDetector:
             if pd.isna(ball_x) or pd.isna(ball_y):
                 continue
 
+            # Buscar jugador más cercano
             closest_player_id = None
             min_dist = float("inf")
             
             for player_id in (1, 2, 3, 4):
-                p_x = row[f"player{player_id}_x"]
-                p_y = row[f"player{player_id}_y"]
+                p_x_col = f"player{player_id}_x"
+                p_y_col = f"player{player_id}_y"
+                
+                if p_x_col not in row or p_y_col not in row:
+                    continue
+                    
+                p_x = row[p_x_col]
+                p_y = row[p_y_col]
                 
                 if pd.isna(p_x) or pd.isna(p_y):
                     continue
@@ -79,36 +96,43 @@ class ShotDetector:
                     min_dist = dist
                     closest_player_id = player_id
             
+            # Si hay un jugador cerca, clasificamos el golpe
             if closest_player_id and min_dist < PROXIMITY_THRESHOLD:
-                # Classify shot
-                # Simple logic: Net vs Baseline
-                # Assuming court is roughly 10m half-length (20m total)
-                # Net is at 0 (or center). Baseline is at +/- 10.
-                # Need to check coordinate system in projected_court.py
-                # Usually origin is center or net.
-                
-                # Let's assume standard coordinates where y is length.
-                # If y is close to 0 -> Net -> Volley
-                # If y is far -> Baseline -> Drive
                 
                 player_y = row[f"player{closest_player_id}_y"]
+                ball_speed_kmh = row["ball_Vnorm1"] * 3.6
                 
-                # Heuristic: Volley if within 3 meters of net?
-                # We need to know where the net is. 
-                # Based on projected_court.py:
-                # origin is calculated from k6 (net post).
-                # So (0,0) is likely the net center or post.
+                # --- LÓGICA DE CLASIFICACIÓN AVANZADA ---
                 
-                if abs(player_y) < 3.5:
-                    shot_type = "Volley"
+                dist_to_net = abs(player_y) # Asumiendo que red está en Y=0
+                
+                # CASO A: JUGADOR EN LA RED (o cerca)
+                if dist_to_net < NET_ZONE_LIMIT:
+                    if ball_speed_kmh > SPEED_SMASH:
+                        shot_type = "Remate (Smash)"
+                    elif ball_speed_kmh > 45: 
+                        shot_type = "Bandeja / Víbora"
+                    else:
+                        shot_type = "Volea"
+                
+                # CASO B: JUGADOR EN EL FONDO
                 else:
-                    shot_type = "Drive"
-                
+                    if ball_speed_kmh < SPEED_LOB:
+                        shot_type = "Globo"
+                    elif ball_speed_kmh > 75:
+                        shot_type = "Bajada de Pared"
+                    else:
+                        # Diferenciar Derecha/Revés requiere saber si es diestro 
+                        # y posición relativa bola-cuerpo. 
+                        # Heurística simple: Lado derecho/izquierdo de la pista?
+                        # Mejor dejarlo genérico si no tenemos keypoints
+                        shot_type = "Fondo (Drive/Revés)"
+
                 shots.append(Shot(
                     frame=frame,
                     player_id=closest_player_id,
                     shot_type=shot_type,
-                    ball_speed=row["ball_Vnorm1"] * 3.6 # km/h
+                    ball_speed=ball_speed_kmh
                 ))
                 last_shot_frame = frame
 
