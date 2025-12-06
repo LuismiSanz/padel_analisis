@@ -7,8 +7,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 import supervision as sv
-# import pims # Removed dependency
-from utils.video import VideoReader
+from utils.video import VideoReader, save_video
 
 from trackers import (
     Keypoint, 
@@ -20,13 +19,16 @@ from trackers import (
     TrackingRunner
 )
 from analytics import DataAnalytics
+from analytics.shot_detector import ShotDetector
 from visualizations.padel_court import padel_court_2d
 from estimate_velocity import BallVelocityEstimator, ImpactType
-from utils.video import save_video
 from config import *
 
-COLLECT_DATA = True
+# --- NUEVO IMPORT PARA PDF ---
+from report_generator import create_full_report
+# -----------------------------
 
+COLLECT_DATA = True
 
 @st.fragment
 def velocity_estimator(video_info: sv.VideoInfo):
@@ -38,8 +40,9 @@ def velocity_estimator(video_info: sv.VideoInfo):
         1, 
     )
 
-    image = np.array(st.session_state["video"][frame_index])
-    st.image(image)
+    if st.session_state["video"] is not None:
+        image = np.array(st.session_state["video"][frame_index])
+        st.image(image)
 
     with st.form("choose-frames"):
         frame_index_t0 = st.number_input(
@@ -87,7 +90,10 @@ def velocity_estimator(video_info: sv.VideoInfo):
             )
             st.write(ball_velocity)
             st.write("Velocidad: ", ball_velocity.norm)
-            st.image(ball_velocity_data.draw_velocity(st.session_state["video"]))
+            
+            if st.session_state["video"] is not None:
+                st.image(ball_velocity_data.draw_velocity(st.session_state["video"]))
+            
             padel_court = padel_court_2d()
             padel_court.add_trace(
                 go.Scatter(
@@ -109,6 +115,7 @@ def velocity_estimator(video_info: sv.VideoInfo):
             st.plotly_chart(padel_court)
 
 
+# --- INITIALIZATION ---
 if "video" not in st.session_state:
     st.session_state["video"] = None
 
@@ -133,6 +140,7 @@ if "keypoints_tracker" not in st.session_state:
 if "runner" not in st.session_state:
     st.session_state["runner"] = None
 
+# --- UI START ---
 st.title("Analítica de Pádel")
 
 uploaded_csv = st.file_uploader("Cargar reporte CSV existente", type=["csv"])
@@ -170,10 +178,9 @@ if missing_weights:
     for w in missing_weights:
         st.code(w)
     st.warning("La aplicación no puede ejecutar la inferencia sin estos pesos.")
-    # Stop execution or disable button (but button is already rendered)
-    # We will just prevent the processing block from running if weights are missing
     upload_video = False 
 
+# --- MAIN LOGIC ---
 if (upload_video or st.session_state["video"] is not None) and uploaded_csv is None:
 
     if upload_video:
@@ -204,16 +211,9 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
                     SELECTED_KEYPOINTS = json.load(f)
             else:
                 st.warning(f"Archivo de puntos clave no encontrado en {FIXED_COURT_KEYPOINTS_LOAD_PATH}. Usando puntos por defecto.")
-                # Default keypoints (approximate for a standard court view if available, or empty list to trigger detection)
-                # For now, we'll try to let the automatic detection handle it or provide a dummy list if needed.
-                # Based on main.py, it seems it might fall back to manual selection or automatic detection.
-                # Let's initialize it as empty list or handle it downstream.
                 SELECTED_KEYPOINTS = [] 
 
         if not SELECTED_KEYPOINTS:
-                # Default to full screen if no keypoints found
-                # Order: Top-Left, Top-Right, Bottom-Left, Bottom-Right
-                # Indices used: 0 (TL), 1 (TR), -1 (BR), -2 (BL) -> TL -> TR -> BR -> BL
                 SELECTED_KEYPOINTS = [
                     [0, 0],
                     [w, 0],
@@ -221,7 +221,7 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
                     [w, h]
                 ]
 
-        # Only use fixed keypoints if we have enough points for homography (12, 18, or 22)
+        # Only use fixed keypoints if we have enough points for homography
         if len(SELECTED_KEYPOINTS) in (12, 18, 22):
             st.session_state["fixed_keypoints_detection"] = Keypoints(
                 [
@@ -233,11 +233,10 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
                 ]
             )
         else:
-            # Fallback to automatic detection if we don't have a valid fixed set
             st.session_state["fixed_keypoints_detection"] = None
 
         keypoints_array = np.array(SELECTED_KEYPOINTS)
-        # Polygon to filter person detections inside padel court
+        
         polygon_zone = sv.PolygonZone(
             polygon=np.concatenate(
                 (
@@ -248,17 +247,15 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
                 ),
                 axis=0
             ),
-            # frame_resolution_wh=video_info.resolution_wh, # Removed in newer supervision versions
         )
 
-        # Instantiate trackers
         st.session_state["players_tracker"] = PlayerTracker(
             PLAYERS_TRACKER_MODEL,
             polygon_zone,
             batch_size=PLAYERS_TRACKER_BATCH_SIZE,
             annotator=PLAYERS_TRACKER_ANNOTATOR,
             show_confidence=True,
-            load_path=None, # PLAYERS_TRACKER_LOAD_PATH, # Disable cache loading to force re-inference
+            load_path=None, 
             save_path=PLAYERS_TRACKER_SAVE_PATH,
         )
 
@@ -266,7 +263,7 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
             PLAYERS_KEYPOINTS_TRACKER_MODEL,
             train_image_size=PLAYERS_KEYPOINTS_TRACKER_TRAIN_IMAGE_SIZE,
             batch_size=PLAYERS_KEYPOINTS_TRACKER_BATCH_SIZE,
-            load_path=None, # PLAYERS_KEYPOINTS_TRACKER_LOAD_PATH,
+            load_path=None, 
             save_path=PLAYERS_KEYPOINTS_TRACKER_SAVE_PATH,
         )
 
@@ -276,7 +273,7 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
             batch_size=BALL_TRACKER_BATCH_SIZE,
             median_max_sample_num=BALL_TRACKER_MEDIAN_MAX_SAMPLE_NUM,
             median=None,
-            load_path=None, # BALL_TRACKER_LOAD_PATH,
+            load_path=None, 
             save_path=BALL_TRACKER_SAVE_PATH,
         )
 
@@ -294,7 +291,7 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
                 st.session_state["players_tracker"], 
                 st.session_state["player_keypoints_tracker"], 
                 st.session_state["ball_tracker"],
-                st.session_state["keypoints_tracker"],    
+                st.session_state["keypoints_tracker"],     
             ],
             video_path="tmp.mp4",
             inference_path=OUTPUT_VIDEO_PATH,
@@ -318,37 +315,79 @@ if (upload_video or st.session_state["video"] is not None) and uploaded_csv is N
     st.video("tmp.mp4")
     
     estimate_velocity = st.checkbox("Calcular Velocidad de la Bola")
-    if estimate_velocity:
+    if estimate_velocity and st.session_state["runner"] is not None:
         st.write("Selecciona un fotograma para calcular la velocidad de la bola:")
         velocity_estimator(st.session_state["runner"].video_info)
     
 if st.session_state["df"] is not None:
     st.header("Datos Recolectados")
     
-    # Download buttons
-    csv = st.session_state["df"].to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Descargar Reporte (CSV)",
-        data=csv,
-        file_name='padel_analytics_report.csv',
-        mime='text/csv',
-    )
+    # --- DOWNLOAD BUTTONS ---
+    col_dl1, col_dl2 = st.columns(2)
     
-    if os.path.exists(OUTPUT_VIDEO_PATH):
-        with open(OUTPUT_VIDEO_PATH, "rb") as file:
-            btn = st.download_button(
-                label="Descargar Video Procesado",
-                data=file,
-                file_name="video_procesado.mp4",
-                mime="video/mp4"
-            )
+    with col_dl1:
+        csv = st.session_state["df"].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📄 Descargar Reporte (CSV)",
+            data=csv,
+            file_name='padel_analytics_report.csv',
+            mime='text/csv',
+        )
+    
+    with col_dl2:
+        if os.path.exists(OUTPUT_VIDEO_PATH):
+            with open(OUTPUT_VIDEO_PATH, "rb") as file:
+                st.download_button(
+                    label="🎥 Descargar Video Procesado",
+                    data=file,
+                    file_name="video_procesado.mp4",
+                    mime="video/mp4"
+                )
+
+    # --- PDF GENERATOR SECTION ---
+    st.markdown("---")
+    st.subheader("📊 Informe Profesional")
+    
+    col_pdf1, col_pdf2 = st.columns([1, 2])
+    
+    with col_pdf1:
+        # Botón para generar el PDF
+        if st.button("Generar PDF de Rendimiento"):
+            with st.spinner("Generando gráficos y maquetando PDF..."):
+                try:
+                    # 1. Guardamos el dataframe actual a un CSV temporal
+                    temp_csv = "temp_data_for_report.csv"
+                    st.session_state["df"].to_csv(temp_csv, index=False)
+                    
+                    # 2. Llamamos a la función generadora del otro archivo
+                    output_pdf = "Informe_Partido.pdf"
+                    create_full_report(temp_csv, output_pdf)
+                    
+                    st.session_state['pdf_ready'] = True
+                    st.success("¡Informe generado con éxito!")
+                    
+                except Exception as e:
+                    st.error(f"Error generando el reporte: {e}")
+
+    with col_pdf2:
+        # Botón para descargar el PDF (aparece solo si ya se generó)
+        if os.path.exists("Informe_Partido.pdf") and st.session_state.get('pdf_ready'):
+            with open("Informe_Partido.pdf", "rb") as pdf_file:
+                st.download_button(
+                    label="📥 Descargar PDF Final",
+                    data=pdf_file,
+                    file_name="Padel_Analyst_Report.pdf",
+                    mime="application/pdf",
+                    key="pdf_download_btn"
+                )
+    st.markdown("---")
+    # -----------------------------
 
     st.write("Primeras 5 filas")
     st.dataframe(st.session_state["df"].head())
     st.markdown(f"- Número de filas: {len(st.session_state['df'])}")
-    # st.write("- Columns: ")
-    # st.write(st.session_state["df"].columns)
 
+    # --- PLOTS & ANALYTICS ---
     velocity_type_choice = st.radio(
         "Tipo", 
         ["Horizontal", "Vertical", "Absoluta"],
@@ -360,20 +399,19 @@ if st.session_state["df"] is not None:
     }
     velocity_type = velocity_type_mapper[velocity_type_choice]
     fig = go.Figure()
-    padel_court = padel_court_2d()
+    
     for player_id in (1, 2, 3, 4):
-        fig.add_trace(
-            go.Scatter(
-                x=st.session_state["df"]["time"], 
-                y=np.abs(
-                    st.session_state["df"][
-                        f"player{player_id}_V{velocity_type}4"
-                    ].to_numpy()
+        # Check if column exists to avoid errors with partial data
+        col_name = f"player{player_id}_V{velocity_type}4"
+        if col_name in st.session_state["df"].columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=st.session_state["df"]["time"], 
+                    y=np.abs(st.session_state["df"][col_name].to_numpy()),
+                    mode='lines',
+                    name=f'Jugador {player_id}',
                 ),
-                mode='lines',
-                name=f'Jugador {player_id}',
-            ),
-        )
+            )
     
     fig.update_layout(
         title="Velocidad de los jugadores en función del tiempo",
@@ -388,252 +426,158 @@ if st.session_state["df"] is not None:
         "maximum_velocity_km/h": [],
     }
     for player_id in (1, 2, 3, 4):
-        players_data["player_id"].append(player_id)
-        players_data["total_distance_m"].append(
-            st.session_state["df"][
-                f"player{player_id}_distance"
-            ].sum()
-        )
-        players_data["mean_velocity_km/h"].append(
-            st.session_state["df"][
-                f"player{player_id}_V{velocity_type}4"
-            ].abs().mean() * 3.6,
-        )
-        players_data["maximum_velocity_km/h"].append(
-            st.session_state["df"][
-                f"player{player_id}_V{velocity_type}4"
-            ].abs().max() * 3.6,
-        )
+        dist_col = f"player{player_id}_distance"
+        vel_col = f"player{player_id}_V{velocity_type}4"
+        
+        if dist_col in st.session_state["df"].columns and vel_col in st.session_state["df"].columns:
+            players_data["player_id"].append(player_id)
+            players_data["total_distance_m"].append(
+                st.session_state["df"][dist_col].sum()
+            )
+            players_data["mean_velocity_km/h"].append(
+                st.session_state["df"][vel_col].abs().mean() * 3.6,
+            )
+            players_data["maximum_velocity_km/h"].append(
+                st.session_state["df"][vel_col].abs().max() * 3.6,
+            )
 
     st.dataframe(pd.DataFrame(players_data).set_index("player_id"))
 
     st.subheader("Velocidad de los jugadores en función del tiempo")
-
     st.plotly_chart(fig)
 
-    st.subheader("Analizar posición, velocidad y aceleración de los jugadores")
+    st.markdown("---")
+    st.subheader("Seguimiento y Análisis de Jugador Individual")
     
     col1, col2 = st.columns((1, 1))
-
-    st.subheader("Seguimiento y Análisis de Jugador Individual")
     
     with col1:
         player_choice = st.radio("Seleccionar Jugador a Rastrear: ", options=[1, 2, 3, 4])
     
     with col2:
-        # Handle potential NaN values if no velocity data is available
-        min_value = st.session_state["df"][
-            f"player{player_choice}_V{velocity_type}4"
-        ].abs().min()
-        max_value = st.session_state["df"][
-            f"player{player_choice}_V{velocity_type}4"
-        ].abs().max()
+        col_name = f"player{player_choice}_V{velocity_type}4"
+        if col_name in st.session_state["df"].columns:
+            min_value = st.session_state["df"][col_name].abs().min()
+            max_value = st.session_state["df"][col_name].abs().max()
+            
+            if pd.isna(min_value) or pd.isna(max_value):
+                min_value, max_value = 0.0, 1.0
 
-        if pd.isna(min_value) or pd.isna(max_value):
-            st.warning(f"No hay datos de velocidad disponibles para el Jugador {player_choice}.")
-            min_value = 0.0
-            max_value = 1.0 # Default range to avoid slider error
-            velocity_interval = (0.0, 1.0)
-        else:
             velocity_interval = st.slider(
                 "Intervalo de Velocidad",
                 float(min_value), 
                 float(max_value),
                 (float(min_value), float(max_value)),
             )
+        else:
+            velocity_interval = (0.0, 1.0)
+            st.warning("Datos de velocidad no disponibles.")
 
-    st.session_state["df"]["QUERY_VELOCITY"] = st.session_state["df"][
-        f"player{player_choice}_V{velocity_type}4"
-    ].abs()
-    min_choice = velocity_interval[0]
-    max_choice = velocity_interval[1]
-    df_scatter = st.session_state["df"].query(
-        "@min_choice <= QUERY_VELOCITY <= @max_choice"
-    )
+    if col_name in st.session_state["df"].columns:
+        st.session_state["df"]["QUERY_VELOCITY"] = st.session_state["df"][col_name].abs()
+        min_choice = velocity_interval[0]
+        max_choice = velocity_interval[1]
         
-    padel_court.add_trace(
-        go.Scatter(
-            x=df_scatter[f"player{player_choice}_x"],
-            y=df_scatter[f"player{player_choice}_y"] * -1,
-            mode="markers",
-            name=f"Jugador {player_choice}",
-            text=df_scatter[
-                f"player{player_choice}_V{velocity_type}4"
-            ].abs() * 3.6,
-            marker=dict(
-                color=df_scatter[
-                        f"player{player_choice}_V{velocity_type}4"
-                ].abs() * 3.6,
-                size=12,
-                showscale=True,
-                colorscale="jet",
-                cmin=min_value * 3.6,
-                cmax=max_value * 3.6,
+        df_scatter = st.session_state["df"].query(
+            "@min_choice <= QUERY_VELOCITY <= @max_choice"
+        )
+            
+        padel_court_viz = padel_court_2d()
+        padel_court_viz.add_trace(
+            go.Scatter(
+                x=df_scatter[f"player{player_choice}_x"],
+                y=df_scatter[f"player{player_choice}_y"] * -1,
+                mode="markers",
+                name=f"Jugador {player_choice}",
+                text=df_scatter[col_name].abs() * 3.6,
+                marker=dict(
+                    color=df_scatter[col_name].abs() * 3.6,
+                    size=12,
+                    showscale=True,
+                    colorscale="jet",
+                    cmin=min_value * 3.6,
+                    cmax=max_value * 3.6,
+                    colorbar=dict(title="Velocidad (km/h)")
+                )
             )
         )
-    )
+        st.plotly_chart(padel_court_viz)
 
-    st.plotly_chart(padel_court)
-
-    padel_court = padel_court_2d()
-    time_span = st.slider(
-        "Intervalo de Tiempo",
-        0.0, 
-        st.session_state["df"]["time"].max(),
-    )
-    df_time = st.session_state["df"].query(
-        "time <= @time_span"
-    )
-    padel_court.add_trace(
-        go.Scatter(
-            x=df_time[f"player{player_choice}_x"],
-            y=df_time[f"player{player_choice}_y"] * -1,
-            mode="markers",
-            name=f"Jugador {player_choice}",
-            text=df_time[
-                f"player{player_choice}_V{velocity_type}4"
-            ].abs() * 3.6,
-            marker=dict(
-                color=df_time[
-                        f"player{player_choice}_V{velocity_type}4"
-                ].abs() * 3.6,
-                size=12,
-                showscale=True,
-                colorscale="jet",
-                cmin=min_value * 3.6,
-                cmax=max_value * 3.6,
+        # Time slider visualization
+        padel_court_time = padel_court_2d()
+        time_span = st.slider(
+            "Intervalo de Tiempo (trayectoria acumulada)",
+            0.0, 
+            float(st.session_state["df"]["time"].max()),
+        )
+        df_time = st.session_state["df"].query("time <= @time_span")
+        
+        padel_court_time.add_trace(
+            go.Scatter(
+                x=df_time[f"player{player_choice}_x"],
+                y=df_time[f"player{player_choice}_y"] * -1,
+                mode="markers",
+                name=f"Jugador {player_choice}",
+                marker=dict(
+                    color=df_time[col_name].abs() * 3.6,
+                    size=8,
+                    showscale=False,
+                    colorscale="jet",
+                    cmin=min_value * 3.6,
+                    cmax=max_value * 3.6,
+                )
             )
         )
-    )
-    st.plotly_chart(padel_court)
+        st.plotly_chart(padel_court_time)
 
+    # --- SHOT CLASSIFICATION ---
     st.subheader("Clasificación de Golpes")
     
-    from analytics.shot_detector import ShotDetector
     shot_detector = ShotDetector()
     
-    # Run detection
     if st.session_state["runner"]:
-        fps = st.session_state["runner"].video_info.fps
+        current_fps = st.session_state["runner"].video_info.fps
     elif st.session_state["df"] is not None and len(st.session_state["df"]) > 1:
-        # Infer FPS from time column
         time_diff = st.session_state["df"]["time"].iloc[1] - st.session_state["df"]["time"].iloc[0]
-        fps = 1.0 / time_diff if time_diff > 0 else 30.0
+        current_fps = 1.0 / time_diff if time_diff > 0 else 30.0
     else:
-        fps = 30.0
+        current_fps = 30.0
         
-    shots_df = shot_detector.detect_shots(st.session_state["df"], fps)
+    shots_df = shot_detector.detect_shots(st.session_state["df"], current_fps)
     
     if not shots_df.empty:
         st.write(f"Total de golpes detectados: {len(shots_df)}")
-        
-        # Display shots dataframe
         st.dataframe(shots_df)
         
-        # Stats per player
-        st.write("Golpes por Jugador:")
-        shots_per_player = shots_df.groupby("player_id")["shot_type"].value_counts().unstack().fillna(0)
-        st.dataframe(shots_per_player)
+        col_stats1, col_stats2 = st.columns(2)
+        with col_stats1:
+            st.write("**Golpes por Jugador:**")
+            shots_per_player = shots_df.groupby("player_id")["shot_type"].value_counts().unstack().fillna(0)
+            st.dataframe(shots_per_player)
         
-        # Average speed per player
-        st.write("Velocidad Media de la Bola (km/h) por Jugador:")
-        avg_speed = shots_df.groupby("player_id")["ball_speed"].mean()
-        st.dataframe(avg_speed)
+        with col_stats2:
+            st.write("**Velocidad Media (km/h) por Jugador:**")
+            avg_speed = shots_df.groupby("player_id")["ball_speed"].mean()
+            st.dataframe(avg_speed)
 
-        # Timeline
+        # Timeline Plot
         fig_timeline = go.Figure()
         for player_id in shots_df["player_id"].unique():
             player_shots = shots_df[shots_df["player_id"] == player_id]
             fig_timeline.add_trace(go.Scatter(
-                x=player_shots["frame"] / fps,
+                x=player_shots["frame"] / current_fps,
                 y=player_shots["ball_speed"],
                 mode='markers',
                 name=f'Jugador {player_id}',
-                text=player_shots["shot_type"]
+                text=player_shots["shot_type"],
+                marker=dict(size=10)
             ))
-        fig_timeline.update_layout(title="Línea de Tiempo de Golpes (Velocidad vs Tiempo)", xaxis_title="Tiempo (s)", yaxis_title="Velocidad (km/h)")
+        fig_timeline.update_layout(
+            title="Línea de Tiempo de Golpes (Velocidad vs Tiempo)", 
+            xaxis_title="Tiempo (s)", 
+            yaxis_title="Velocidad Bola (km/h)"
+        )
         st.plotly_chart(fig_timeline)
 
     else:
-        st.warning("No se detectaron golpes. Verifica si el rastreo de la bola funciona correctamente.")
-
-    def plotly_fig2array(fig):
-        """
-        Convert a plotly figure to numpy array
-        """
-        import io
-        from PIL import Image
-        print("HERE3")
-        fig_bytes = fig.to_image(format="png")
-        print("HERE4")
-        buf = io.BytesIO(fig_bytes)
-        img = Image.open(buf)
-        return np.asarray(img)
-
-    def court_frames(player_choice, velocity_type):
-
-        padel_court = padel_court_2d()
-
-        for t in st.session_state["df"]["time"]:
-
-            print("HERE1")
-
-            x_values = st.session_state["df"].query(
-                "time <= @t"
-            )[f"player{player_choice}_x"]
-
-            y_values = st.session_state["df"].query(
-                "time <= @t"
-            )[f"player{player_choice}_y"] * -1
-
-            v_values = st.session_state["df"].query(
-                "time <= @t"
-            )[f"player{player_choice}_V{velocity_type}4"].abs() * 3.6
-
-            padel_court.add_trace(
-                go.Scatter(
-                            x=x_values,
-                            y=y_values,
-                            mode="markers",
-                            name=f"Jugador {player_choice}",
-                            text=v_values,
-                            marker=dict(
-                                color=v_values,
-                                size=12,
-                                showscale=True,
-                                colorscale="jet",
-                                cmin=min_value * 3.6,
-                                cmax=max_value * 3.6,
-                            )
-                        )
-            )
-
-            print("HERE2")
-
-            yield plotly_fig2array(padel_court)
-
-    # for frame in court_frames(player_choice, velocity_type):
-    #     print(type(frame))
-    #    break    
-
-    # save_video(
-    #     court_frames(player_choice, velocity_type), 
-    #   "positions.mp4", 
-    #     fps=st.session_state["runner"].video_info.fps,
-    #    w=st.session_state["runner"].video_info.width,
-    #    h=st.session_state["runner"].video_info.height,
-    #)
-
-        
-
-        
-        
-        
-
-        
-        
-        
-
- 
-        
-
+        st.info("No se han detectado golpes claros en este segmento.")
